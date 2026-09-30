@@ -1,0 +1,40 @@
+{
+  "name": "opencode-memory-statusline",
+  "version": "0.4.0",
+  "description": "OpenCode TUI plugin: local-memory-mcp summary in the sidebar, plus a compact status-bar line when the sidebar is collapsed.",
+  "type": "module",
+  "license": "MIT",
+  "author": "vheins",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vheins/opencode-memory-statusline.git"
+  },
+  "homepage": "https://github.com/vheins/opencode-memory-statusline#readme",
+  "bugs": {
+    "url": "https://github.com/vheins/opencode-memory-statusline/issues"
+  },
+  "engines": {
+    "opencode": ">=1.18.0"
+  },
+  "exports": {
+    "./tui": {
+      "import": "./src/tui.jsx"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "tui",
+    "sidebar",
+    "statusline",
+    "local-memory-mcp",
+    "memory",
+    "task-management"
+  ]
+}
