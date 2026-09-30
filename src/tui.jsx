@@ -23,7 +23,6 @@
  *
  * Env overrides:
  *   LOCAL_MEMORY_API    base URL of the daemon (default http://127.0.0.1:3456)
- *   LOCAL_MEMORY_OWNER  force owner scope
  *   LOCAL_MEMORY_REPO   force repo scope
  */
 import { createMemo, createSignal, onCleanup, Show } from "solid-js"

@@ -45,21 +45,20 @@ before any session has touched a memory tool):
 | Endpoint | Used for |
 | --- | --- |
 | `GET /api/health` | daemon version (shown next to the header) |
-| `GET /api/stats?owner=&repo=` | repo-scoped memories + task pipeline |
+| `GET /api/repos` | repo-scoped memories + task pipeline (one aggregated row per repo) |
 
-Only the **current repository** is shown. The scope is derived from the git
-remote of the session directory (`git -C <dir> remote get-url origin`),
-falling back to the directory name. Task counters are limited to the
-workflow states that matter for a live queue: **backlog**, **pending** and
-**in-progress**.
+Only the **current repository** is shown. The scope is the session directory
+name first, then the git remote (`git -C <dir> remote get-url origin`); the
+first candidate that actually has a row in the database wins, exact match
+only. Task counters are limited to the workflow states that matter for a live
+queue: **backlog**, **pending** and **in-progress**.
 
 ## Configuration
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
 | `LOCAL_MEMORY_API` | `http://127.0.0.1:3456` | daemon base URL |
-| `LOCAL_MEMORY_OWNER` | from git remote | force owner scope |
-| `LOCAL_MEMORY_REPO` | from git remote | force repo scope |
+| `LOCAL_MEMORY_REPO` | from session dir / git remote | force repo scope |
 
 Refresh interval: 15s. Clicking the `▼ Memory` header collapses the section.
 
