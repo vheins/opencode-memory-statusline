@@ -13,8 +13,13 @@
  *      narrow (OpenCode hides the sidebar at width <= 120).
  *
  * Data source — local-memory-mcp HTTP API (default http://127.0.0.1:3456):
- *   GET /api/health              -> daemon version
- *   GET /api/stats?owner=&repo=  -> repo-scoped memories + tasks
+ *   GET /api/health  -> daemon version
+ *   GET /api/repos   -> per-repo aggregates (summed across every owner)
+ *
+ * `/api/stats` is deliberately NOT used: it filters `owner` strictly, and the
+ * daemon's `/api/repos` records carry no owner, so an owner-scoped query for
+ * a bare repo name returns zeros. `/api/repos` already aggregates every owner
+ * into one row per repo, which is what "this repository" means to the user.
  *
  * Env overrides:
  *   LOCAL_MEMORY_API    base URL of the daemon (default http://127.0.0.1:3456)
@@ -27,7 +32,7 @@ import { execFileSync } from "node:child_process"
 import { basename } from "node:path"
 
 const PLUGIN_ID = "memory-statusline"
-const PLUGIN_VERSION = "0.4.0"
+const PLUGIN_VERSION = "0.5.0"
 const API_BASE = (process.env.LOCAL_MEMORY_API || "http://127.0.0.1:3456").replace(/\/+$/, "")
 const REFRESH_MS = 15000
 const SIDEBAR_MIN_WIDTH = 120
@@ -41,10 +46,23 @@ const ARROW_RIGHT = "\u25B6" // ▶
 const DOT = "\u25CF" // ●
 const RULE = "\u2500" // ─
 
-function resolveScope(directory) {
-  let owner
-  let repo
+/**
+ * Candidate repo names for the current workspace, most specific first.
+ *
+ * The **directory name comes first**: it is what the user opened and what the
+ * agent normally registers work under. The git remote is only a fallback — a
+ * folder can carry a stale or reused remote (e.g. `odoo-stp/` still points at
+ * `vheins/odoo-fleet.git`, whose row in the memory DB is a different, older
+ * project). The caller then picks whichever candidate actually has a row.
+ */
+function resolveRepoCandidates(directory) {
+  const forced = process.env.LOCAL_MEMORY_REPO
+  if (forced) return [forced]
+
+  const candidates = []
   if (directory) {
+    const base = basename(directory)
+    if (base) candidates.push(base)
     try {
       const url = execFileSync("git", ["-C", directory, "remote", "get-url", "origin"], {
         encoding: "utf8",
@@ -52,19 +70,12 @@ function resolveScope(directory) {
         stdio: ["ignore", "pipe", "ignore"],
       }).trim()
       const match = url.match(/[:/]([^/:]+)\/([^/]+?)(?:\.git)?$/)
-      if (match) {
-        owner = match[1]
-        repo = match[2]
-      }
+      if (match && !candidates.includes(match[2])) candidates.push(match[2])
     } catch {
-      // not a git repo / no remote — fall back to the directory name
+      // not a git repo / no remote — the directory name stands alone
     }
-    if (!repo) repo = basename(directory)
   }
-  return {
-    owner: process.env.LOCAL_MEMORY_OWNER || owner,
-    repo: process.env.LOCAL_MEMORY_REPO || repo,
-  }
+  return candidates
 }
 
 async function request(path, signal) {
@@ -74,7 +85,7 @@ async function request(path, signal) {
   return body?.data?.attributes ?? body?.data ?? body
 }
 
-function createMemory(scope) {
+function createMemory(candidates) {
   const [data, setData] = createSignal()
   const [error, setError] = createSignal()
   const controller = new AbortController()
@@ -83,13 +94,16 @@ function createMemory(scope) {
   const load = async () => {
     try {
       const health = await request("/api/health", controller.signal)
-      let scoped
-      if (scope.repo) {
-        const query = `owner=${encodeURIComponent(scope.owner ?? "")}&repo=${encodeURIComponent(scope.repo)}`
-        scoped = await request(`/api/stats?${query}`, controller.signal)
-      }
+      const repos = await request("/api/repos", controller.signal)
+      const list = (Array.isArray(repos) ? repos : (repos?.data ?? [])).map((item) => item?.attributes ?? item)
+
+      // Exact match only: a fuzzy match could silently show another project's
+      // numbers, which is the very confusion this resolver exists to prevent.
+      const repo = candidates.find((name) => list.some((item) => item?.repo === name))
+      const entry = repo ? list.find((item) => item?.repo === repo) : undefined
+
       if (disposed) return
-      setData({ health, scoped })
+      setData({ health, repo, entry })
       setError()
     } catch (err) {
       if (disposed || controller.signal.aborted) return
@@ -113,12 +127,12 @@ function createMemory(scope) {
 function SidebarView(props) {
   const theme = () => props.api.theme.current
   const [open, setOpen] = createSignal(true)
-  const scope = resolveScope(props.api.state.path.directory)
-  const state = createMemory(scope)
+  const candidates = resolveRepoCandidates(props.api.state.path.directory)
+  const state = createMemory(candidates)
 
   const health = createMemo(() => state.data()?.health)
-  const scoped = createMemo(() => state.data()?.scoped)
-  const tasks = createMemo(() => scoped()?.taskStats)
+  const repo = createMemo(() => state.data()?.repo)
+  const entry = createMemo(() => state.data()?.entry)
 
   return (
     <box>
@@ -137,34 +151,28 @@ function SidebarView(props) {
             {`offline ${BULLET} ${state.error()}`}
           </text>
         </Show>
-        <Show when={scope.repo}>
-          <text fg={theme().text}>{`${RULE} ${scope.repo}`}</text>
+        <Show when={repo()}>
+          <text fg={theme().text}>{`${RULE} ${repo()}`}</text>
         </Show>
-        <Show when={scoped()}>
-          <text fg={theme().textMuted}>{`${fmt(scoped().total)} mem`}</text>
-        </Show>
-        <Show when={tasks()}>
-          {(t) => (
-            <>
-              {/* Two short rows: never wraps, never clipped at the sidebar bottom. */}
-              <box flexDirection="row" gap={1}>
-                <text flexShrink={0} fg={theme().warning}>
-                  {DOT}
-                </text>
-                <text fg={theme().text} wrapMode="none">
-                  {`${fmt(t().backlog)} backlog ${BULLET} ${fmt(t().pending)} pending`}
-                </text>
-              </box>
-              <box flexDirection="row" gap={1}>
-                <text flexShrink={0} fg={theme().accent}>
-                  {DOT}
-                </text>
-                <text fg={theme().textMuted} wrapMode="none">
-                  {`${fmt(t().in_progress)} in-progress`}
-                </text>
-              </box>
-            </>
-          )}
+        <Show when={entry()}>
+          <text fg={theme().textMuted}>{`${fmt(entry().memoryCount)} mem`}</text>
+          {/* Two short rows: never wraps, never clipped at the sidebar bottom. */}
+          <box flexDirection="row" gap={1}>
+            <text flexShrink={0} fg={theme().warning}>
+              {DOT}
+            </text>
+            <text fg={theme().text} wrapMode="none">
+              {`${fmt(entry().backlogCount)} backlog ${BULLET} ${fmt(entry().pendingCount)} pending`}
+            </text>
+          </box>
+          <box flexDirection="row" gap={1}>
+            <text flexShrink={0} fg={theme().accent}>
+              {DOT}
+            </text>
+            <text fg={theme().textMuted} wrapMode="none">
+              {`${fmt(entry().inProgressCount)} in-progress`}
+            </text>
+          </box>
         </Show>
       </Show>
     </box>
@@ -178,30 +186,29 @@ function StatusBarView(props) {
   const dims = useTerminalDimensions()
   const collapsed = createMemo(() => dims().width <= SIDEBAR_MIN_WIDTH)
 
-  const scope = resolveScope(props.api.state.path.directory)
-  const state = createMemory(scope)
-  const tasks = createMemo(() => state.data()?.scoped?.taskStats)
+  const candidates = resolveRepoCandidates(props.api.state.path.directory)
+  const state = createMemory(candidates)
+  const entry = createMemo(() => state.data()?.entry)
+  const repo = createMemo(() => state.data()?.repo)
 
   return (
     <Show when={collapsed()}>
       <box flexDirection="row" gap={2} paddingLeft={2} paddingRight={2}>
-        <Show when={tasks()}>
-          {(t) => (
-            <box flexDirection="row" gap={1}>
-              <text flexShrink={0} fg={theme().warning}>
-                {DOT}
-              </text>
-              <text fg={theme().textMuted} wrapMode="none">
-                {`${fmt(t().backlog)} backlog ${BULLET} ${fmt(t().pending)} pending ${BULLET} ${fmt(
-                  t().in_progress,
-                )} in-progress`}
-              </text>
-            </box>
-          )}
+        <Show when={entry()}>
+          <box flexDirection="row" gap={1}>
+            <text flexShrink={0} fg={theme().warning}>
+              {DOT}
+            </text>
+            <text fg={theme().textMuted} wrapMode="none">
+              {`${fmt(entry().backlogCount)} backlog ${BULLET} ${fmt(entry().pendingCount)} pending ${BULLET} ${fmt(
+                entry().inProgressCount,
+              )} in-progress`}
+            </text>
+          </box>
         </Show>
-        <Show when={scope.repo}>
+        <Show when={repo()}>
           <text fg={theme().textMuted} wrapMode="none">
-            {scope.repo}
+            {repo()}
           </text>
         </Show>
       </box>
