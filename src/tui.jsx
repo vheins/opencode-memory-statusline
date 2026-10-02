@@ -27,11 +27,11 @@
  */
 import { createMemo, createSignal, onCleanup, Show } from "solid-js"
 import { useTerminalDimensions } from "@opentui/solid"
-import { execFileSync } from "node:child_process"
+import { execFile } from "node:child_process"
 import { basename } from "node:path"
 
 const PLUGIN_ID = "memory-statusline"
-const PLUGIN_VERSION = "0.5.0"
+const PLUGIN_VERSION = "0.5.1"
 const API_BASE = (process.env.LOCAL_MEMORY_API || "http://127.0.0.1:3456").replace(/\/+$/, "")
 const REFRESH_MS = 15000
 const SIDEBAR_MIN_WIDTH = 120
@@ -54,27 +54,59 @@ const RULE = "\u2500" // ─
  * `vheins/odoo-fleet.git`, whose row in the memory DB is a different, older
  * project). The caller then picks whichever candidate actually has a row.
  */
+const repoCandidatesCache = new Map()
+const repoCandidatesInFlight = new Map()
+
+function directoryCandidate(directory) {
+  if (!directory) return []
+  const base = basename(directory)
+  return base ? [base] : []
+}
+
+/**
+ * Resolve candidates off the render path.
+ *
+ * The directory name is available synchronously; the git remote is only a
+ * fallback, so it is fetched with async `execFile` (never `execFileSync`) and
+ * memoized per directory. The synchronous return value is always the
+ * directory-name candidate, so rendering never blocks on a git spawn; callers
+ * that want the remote candidate `await` the promise, which resolves to the
+ * full list and warms the cache for later sync reads.
+ */
 function resolveRepoCandidates(directory) {
   const forced = process.env.LOCAL_MEMORY_REPO
-  if (forced) return [forced]
+  if (forced) return { immediate: [forced], pending: Promise.resolve([forced]) }
 
-  const candidates = []
-  if (directory) {
-    const base = basename(directory)
-    if (base) candidates.push(base)
-    try {
-      const url = execFileSync("git", ["-C", directory, "remote", "get-url", "origin"], {
-        encoding: "utf8",
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim()
-      const match = url.match(/[:/]([^/:]+)\/([^/]+?)(?:\.git)?$/)
-      if (match && !candidates.includes(match[2])) candidates.push(match[2])
-    } catch {
-      // not a git repo / no remote — the directory name stands alone
-    }
-  }
-  return candidates
+  const immediate = directoryCandidate(directory)
+  const cached = repoCandidatesCache.get(directory)
+  if (cached) return { immediate: cached, pending: Promise.resolve(cached) }
+
+  const pending =
+    repoCandidatesInFlight.get(directory) ??
+    new Promise((resolve) => {
+      if (!directory) {
+        resolve(immediate)
+        return
+      }
+      execFile(
+        "git",
+        ["-C", directory, "remote", "get-url", "origin"],
+        { encoding: "utf8", timeout: 2000, windowsHide: true },
+        (err, stdout) => {
+          const candidates = immediate.slice()
+          if (!err && typeof stdout === "string") {
+            const match = stdout.trim().match(/[:/]([^/:]+)\/([^/]+?)(?:\.git)?$/)
+            if (match && !candidates.includes(match[2])) candidates.push(match[2])
+          }
+          repoCandidatesCache.set(directory, candidates)
+          repoCandidatesInFlight.delete(directory)
+          resolve(candidates)
+        },
+      )
+    })
+
+  repoCandidatesInFlight.set(directory, pending)
+  return { immediate, pending }
 }
 
 async function request(path, signal) {
@@ -84,11 +116,52 @@ async function request(path, signal) {
   return body?.data?.attributes ?? body?.data ?? body
 }
 
-function createMemory(candidates) {
+const SHARED_REFRESH_MS = REFRESH_MS
+let sharedStore = null
+
+/**
+ * A single module-level store shared by both slots.
+ *
+ * Previously each slot mounted its own `createMemory`: two independent
+ * `setInterval` loops, two initial `fetch` bursts, and a sync git spawn in each
+ * render body. One store means one timer, one fetch cycle, and one candidate
+ * resolution for the whole app. Ref-counted so the timer stops when the last
+ * consumer unmounts.
+ */
+function acquireMemory(directory) {
+  if (!sharedStore || sharedStore.directory !== directory) {
+    if (sharedStore) sharedStore.dispose()
+    sharedStore = createSharedStore(directory)
+  }
+  const store = sharedStore
+  store.refs += 1
+  let released = false
+  return {
+    data: store.data,
+    error: store.error,
+    dispose() {
+      if (released) return
+      released = true
+      store.refs -= 1
+      if (store.refs <= 0) {
+        store.dispose()
+        if (sharedStore === store) sharedStore = null
+      }
+    },
+  }
+}
+
+function createSharedStore(directory) {
+  const { immediate, pending } = resolveRepoCandidates(directory)
   const [data, setData] = createSignal()
   const [error, setError] = createSignal()
   const controller = new AbortController()
+  let candidates = immediate
   let disposed = false
+
+  void pending.then((list) => {
+    if (!disposed) candidates = list
+  })
 
   const load = async () => {
     try {
@@ -111,14 +184,18 @@ function createMemory(candidates) {
   }
 
   void load()
-  const timer = setInterval(() => void load(), REFRESH_MS)
-  onCleanup(() => {
-    disposed = true
-    clearInterval(timer)
-    controller.abort()
-  })
-
-  return { data, error }
+  const timer = setInterval(() => void load(), SHARED_REFRESH_MS)
+  return {
+    directory,
+    refs: 0,
+    data,
+    error,
+    dispose() {
+      disposed = true
+      clearInterval(timer)
+      controller.abort()
+    },
+  }
 }
 
 /* ------------------------------------------------------------------ sidebar */
@@ -126,8 +203,9 @@ function createMemory(candidates) {
 function SidebarView(props) {
   const theme = () => props.api.theme.current
   const [open, setOpen] = createSignal(true)
-  const candidates = resolveRepoCandidates(props.api.state.path.directory)
-  const state = createMemory(candidates)
+  const store = acquireMemory(props.api.state.path.directory)
+  onCleanup(() => store.dispose())
+  const state = store
 
   const health = createMemo(() => state.data()?.health)
   const repo = createMemo(() => state.data()?.repo)
@@ -185,8 +263,9 @@ function StatusBarView(props) {
   const dims = useTerminalDimensions()
   const collapsed = createMemo(() => dims().width <= SIDEBAR_MIN_WIDTH)
 
-  const candidates = resolveRepoCandidates(props.api.state.path.directory)
-  const state = createMemory(candidates)
+  const store = acquireMemory(props.api.state.path.directory)
+  onCleanup(() => store.dispose())
+  const state = store
   const entry = createMemo(() => state.data()?.entry)
   const repo = createMemo(() => state.data()?.repo)
 

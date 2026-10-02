@@ -1,6 +1,6 @@
 {
   "name": "@vheins/opencode-memory-statusline",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "OpenCode TUI plugin: local-memory-mcp summary in the sidebar, plus a compact status-bar line when the sidebar is collapsed.",
   "type": "module",
   "license": "MIT",
